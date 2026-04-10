@@ -1,4 +1,5 @@
 What This Is
+
 HTF v2 is a way to let a text-based AI experience a song as a structured, time-evolving signal.
 It does not give the AI raw audio hearing in the biological sense.
 It does something different:
