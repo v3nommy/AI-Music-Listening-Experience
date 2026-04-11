@@ -1,4 +1,4 @@
-import os, json, math, datetime
+import os, json, math, datetime, subprocess, tempfile, shutil
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -23,8 +23,9 @@ N_FFT = 2048
 WINDOW_S = 10
 CHROMA_BIN_S = 2
 
-ENERGY_THRESH = {"low": 0.05, "high": 0.10}
-BRIGHT_THRESH = {"dark": 1500.0, "bright": 2200.0}
+# Fallback thresholds (used only if adaptive computation fails)
+ENERGY_THRESH_DEFAULT = {"low": 0.05, "high": 0.10}
+BRIGHT_THRESH_DEFAULT = {"dark": 1500.0, "bright": 2200.0}
 
 NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 
@@ -34,22 +35,57 @@ MINOR_PROFILE = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34
 MAJOR_PROFILE /= MAJOR_PROFILE.sum()
 MINOR_PROFILE /= MINOR_PROFILE.sum()
 
-def tier_energy(x):
-    if x < ENERGY_THRESH["low"]:
+def compute_adaptive_thresholds(energy_1hz, bright_1hz):
+    """Compute percentile-based thresholds from the track's own data."""
+    e = np.array(energy_1hz, dtype=float)
+    b = np.array(bright_1hz, dtype=float)
+    energy_thresh = {
+        "low": float(np.percentile(e, 25)),
+        "high": float(np.percentile(e, 75)),
+    }
+    bright_thresh = {
+        "dark": float(np.percentile(b, 25)),
+        "bright": float(np.percentile(b, 75)),
+    }
+    # Guard against degenerate tracks where all values are identical
+    if energy_thresh["low"] >= energy_thresh["high"]:
+        energy_thresh = ENERGY_THRESH_DEFAULT
+    if bright_thresh["dark"] >= bright_thresh["bright"]:
+        bright_thresh = BRIGHT_THRESH_DEFAULT
+    return energy_thresh, bright_thresh
+
+def tier_energy(x, thresh):
+    if x < thresh["low"]:
         return "low"
-    if x <= ENERGY_THRESH["high"]:
+    if x <= thresh["high"]:
         return "medium"
     return "high"
 
-def tier_brightness(hz):
-    if hz < BRIGHT_THRESH["dark"]:
+def tier_brightness(hz, thresh):
+    if hz < thresh["dark"]:
         return "dark"
-    if hz <= BRIGHT_THRESH["bright"]:
+    if hz <= thresh["bright"]:
         return "moderate"
     return "bright"
 
+def _ensure_wav(path):
+    """If path is not a WAV file, convert to a temp WAV via ffmpeg. Returns (wav_path, cleanup_fn)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".wav", ".wave"):
+        return path, lambda: None
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(f"Input file is {ext}, but ffmpeg is not installed. Install ffmpeg or convert to WAV manually.")
+    tmp = tempfile.mktemp(suffix=".wav")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", path, "-ar", "44100", "-ac", "1", "-sample_fmt", "s16", tmp],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed: {result.stderr[:500]}")
+    return tmp, lambda: os.unlink(tmp)
+
 def load_audio_mono(path):
-    \"\"\"Load audio (any SR), convert to mono float32 in [-1,1] if possible.\"\"\"
+    """Load audio (any SR), convert to mono float32 in [-1,1] if possible."""
     if HAS_SF:
         y, sr = sf.read(path, always_2d=True)
         y = y.mean(axis=1).astype(np.float32)
@@ -233,6 +269,31 @@ def estimate_key_from_chroma(chroma_mean):
     idx, mode = best[1], best[2]
     return f"{NOTE_NAMES[idx]} {mode}", "Krumhansl-Schmuckler on mean chroma (STFT pitch-class mapping)"
 
+def key_regions(chroma, t_frames, duration_s, region_s=30):
+    """Estimate key per region_s-second window. Returns a list of {start, end, key} dicts."""
+    n_regions = max(1, int(math.ceil(duration_s / region_s)))
+    regions = []
+    for r in range(n_regions):
+        start = r * region_s
+        end = min((r + 1) * region_s, duration_s)
+        mask = (t_frames >= start) & (t_frames < end)
+        if np.any(mask):
+            cm = np.mean(chroma[:, mask], axis=1)
+            cm = normalize_chroma(cm)
+            key_name, _ = estimate_key_from_chroma(cm)
+        else:
+            key_name = regions[-1]["key"] if regions else "unknown"
+        regions.append({"start": float(round(start, 1)), "end": float(round(end, 1)), "key": key_name})
+
+    # Merge consecutive regions with the same key
+    merged = [regions[0]]
+    for r in regions[1:]:
+        if r["key"] == merged[-1]["key"]:
+            merged[-1]["end"] = r["end"]
+        else:
+            merged.append(r)
+    return merged
+
 def agg_to_1hz(values, times, duration_s):
     n = int(math.ceil(duration_s))
     out = np.zeros(n, dtype=float)
@@ -263,7 +324,7 @@ def peak_events(t_frames, values, kind, min_gap_s=12.0, top_k=12):
     selected.sort(key=lambda e: e["t_s"])
     return selected
 
-def build_interpretive_map(energy_1hz, bright_1hz, flux_1hz, onset_1hz, window_s=10):
+def build_interpretive_map(energy_1hz, bright_1hz, flux_1hz, onset_1hz, energy_thresh, bright_thresh, phases, window_s=10):
     N = len(energy_1hz)
     windows = []
     for start in range(0, N, window_s):
@@ -277,37 +338,161 @@ def build_interpretive_map(energy_1hz, bright_1hz, flux_1hz, onset_1hz, window_s
             "start": int(start),
             "end": int(end),
             "energy_avg": float(round(e, 6)),
-            "energy_tier": tier_energy(e),
+            "energy_tier": tier_energy(e, energy_thresh),
             "brightness_avg_hz": float(round(b, 3)),
-            "brightness_tier": tier_brightness(b),
+            "brightness_tier": tier_brightness(b, bright_thresh),
             "flux_avg": float(round(f, 6)),
         }
         if o is not None:
             w["onset_avg"] = float(round(o, 6))
         windows.append(w)
 
-    intro = windows[0] if windows else None
-    peak_e = max(windows, key=lambda x: x["energy_avg"]) if windows else None
-    peak_b = max(windows, key=lambda x: x["brightness_avg_hz"]) if windows else None
+    # --- Build narrative summary ---
+    e_arr = np.array(energy_1hz, dtype=float)
+    b_arr = np.array(bright_1hz, dtype=float)
+    f_arr = np.array(flux_1hz, dtype=float)
 
-    summary = []
-    if intro:
-        summary.append(f"Intro {intro['start']}-{intro['end']}s: energy={intro['energy_tier']} ({intro['energy_avg']}), brightness={intro['brightness_tier']} ({intro['brightness_avg_hz']} Hz).")
-    if peak_e:
-        summary.append(f"Peak energy {peak_e['start']}-{peak_e['end']}s: {peak_e['energy_avg']} ({peak_e['energy_tier']}).")
-    if peak_b:
-        summary.append(f"Peak brightness {peak_b['start']}-{peak_b['end']}s: {peak_b['brightness_avg_hz']} Hz ({peak_b['brightness_tier']}).")
-    summary.append("Tier thresholds are stored in interpretive_map.thresholds for reproducibility.")
+    peak_e_idx = int(np.argmax(e_arr))
+    peak_b_idx = int(np.argmax(b_arr))
+    min_e_idx = int(np.argmin(e_arr))
+
+    # Overall arc: compare first quarter vs peak vs last quarter
+    q1 = max(1, N // 4)
+    q3 = max(q1 + 1, 3 * N // 4)
+    e_start = float(np.mean(e_arr[:q1]))
+    e_end = float(np.mean(e_arr[q3:]))
+    e_peak = float(e_arr[peak_e_idx])
+
+    narrative = []
+
+    # Opening character
+    intro_tier = tier_energy(float(np.mean(e_arr[:min(30, N)])), energy_thresh)
+    intro_bright = tier_brightness(float(np.mean(b_arr[:min(30, N)])), bright_thresh)
+    narrative.append(f"Opens {intro_tier} and {intro_bright}.")
+
+    # Build/peak description
+    if e_peak > e_start * 1.5 and peak_e_idx > q1:
+        narrative.append(f"Energy builds to peak at {peak_e_idx}s ({e_peak:.6f} RMS), a {e_peak/max(e_start, 1e-9):.1f}x increase from the opening.")
+    elif e_peak > e_start:
+        narrative.append(f"Energy peaks at {peak_e_idx}s.")
+
+    # Brightness peak if distinct from energy peak
+    if abs(peak_b_idx - peak_e_idx) > 15:
+        narrative.append(f"Brightness peaks separately at {peak_b_idx}s ({b_arr[peak_b_idx]:.0f} Hz).")
+
+    # Closing character
+    if e_end < e_start * 0.5:
+        narrative.append("Fades to a quieter close than the opening.")
+    elif e_end > e_start * 1.5:
+        narrative.append("Closes with more energy than it started.")
+    else:
+        narrative.append("Returns to roughly opening energy levels.")
+
+    # Phase-based highlights
+    if phases and len(phases) > 1:
+        phase_energies = []
+        for ph in phases:
+            a = int(max(0, math.floor(ph["start"])))
+            b_idx = int(min(N, math.ceil(ph["end"])))
+            if b_idx > a:
+                phase_energies.append((ph["label"], float(np.mean(e_arr[a:b_idx]))))
+        if phase_energies:
+            loudest = max(phase_energies, key=lambda x: x[1])
+            quietest = min(phase_energies, key=lambda x: x[1])
+            if loudest[0] != quietest[0]:
+                narrative.append(f"Loudest phase: {loudest[0]}. Quietest: {quietest[0]}.")
 
     return {
         "window_s": int(window_s),
         "thresholds": {
-            "energy_rms": {"low_lt": ENERGY_THRESH["low"], "medium_le": ENERGY_THRESH["high"], "high_gt": ENERGY_THRESH["high"]},
-            "brightness_hz": {"dark_lt": BRIGHT_THRESH["dark"], "moderate_le": BRIGHT_THRESH["bright"], "bright_gt": BRIGHT_THRESH["bright"]},
+            "energy_rms": {"low_lt": energy_thresh["low"], "medium_le": energy_thresh["high"], "high_gt": energy_thresh["high"]},
+            "brightness_hz": {"dark_lt": bright_thresh["dark"], "moderate_le": bright_thresh["bright"], "bright_gt": bright_thresh["bright"]},
         },
+        "thresholds_method": "percentile-adaptive (25th/75th of track)",
         "windows": windows,
-        "summary_text": " ".join(summary),
+        "summary_text": " ".join(narrative),
     }
+
+def detect_phases(energy_1hz, duration_s, min_phase_s=15, max_phases=8):
+    """Detect structural phases from energy contour using change-point detection."""
+    e = np.array(energy_1hz, dtype=float)
+    N = len(e)
+    if N < min_phase_s * 2:
+        return [{"label": "full", "start": 0.0, "end": duration_s}]
+
+    # Smooth heavily to get macro contour
+    win = max(min_phase_s, 15)
+    smoothed = smooth_1d(e, win=win)
+
+    # Compute derivative and find significant changes
+    deriv = np.diff(smoothed)
+    abs_deriv = np.abs(deriv)
+
+    # Threshold: points where change rate exceeds mean + 1.5*std
+    mu = float(np.mean(abs_deriv))
+    sd = float(np.std(abs_deriv))
+    threshold = mu + 1.5 * sd
+
+    # Find peaks in abs_deriv as candidate boundaries
+    candidates = []
+    for i in range(1, len(abs_deriv) - 1):
+        if abs_deriv[i] > threshold and abs_deriv[i] > abs_deriv[i-1] and abs_deriv[i] >= abs_deriv[i+1]:
+            candidates.append(i)
+
+    # Enforce minimum gap between boundaries
+    boundaries = []
+    last = -min_phase_s
+    for c in candidates:
+        if c - last >= min_phase_s and (N - c) >= min_phase_s:
+            boundaries.append(c)
+            last = c
+        if len(boundaries) >= max_phases - 1:
+            break
+
+    # If we found fewer than 1 boundary, fall back to energy-based splits
+    if len(boundaries) == 0:
+        # Split into 3-5 equal segments and label by relative energy
+        n_segments = min(5, max(3, N // 60))
+        seg_len = N // n_segments
+        boundaries = [seg_len * i for i in range(1, n_segments)]
+
+    # Build phases from boundaries
+    edges = [0] + boundaries + [N]
+    phases = []
+    for i in range(len(edges) - 1):
+        start_s = float(edges[i])
+        end_s = float(min(edges[i + 1], N))
+        seg_energy = float(np.mean(e[int(start_s):int(end_s)]))
+        phases.append({"start": start_s, "end": end_s, "_energy": seg_energy})
+
+    # Label phases by relative energy within the track
+    energies = [p["_energy"] for p in phases]
+    e_max = max(energies) if energies else 1.0
+    e_min = min(energies) if energies else 0.0
+    e_range = e_max - e_min if e_max > e_min else 1.0
+
+    for i, p in enumerate(phases):
+        rel = (p["_energy"] - e_min) / e_range
+        if i == 0:
+            label = "intro"
+        elif i == len(phases) - 1:
+            label = "outro"
+        elif rel > 0.7:
+            label = "climax"
+        elif rel > 0.4:
+            if i > 0 and p["_energy"] > phases[i-1]["_energy"]:
+                label = "build"
+            else:
+                label = "descent"
+        else:
+            label = "rest"
+        p["label"] = label
+
+    # Clean up internal keys
+    for p in phases:
+        del p["_energy"]
+
+    return phases
 
 # --- Mel filterbank (for mel spectrogram graph) ---
 def hz_to_mel(hz): return 2595.0 * np.log10(1.0 + hz/700.0)
@@ -334,8 +519,12 @@ def power_to_db(S, ref=1.0, amin=1e-10):
 def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phases=None):
     os.makedirs(out_dir, exist_ok=True)
 
-    # Load + resample
-    y, sr = load_audio_mono(audio_path)
+    # Convert to WAV if needed, then load + resample
+    wav_path, cleanup = _ensure_wav(audio_path)
+    try:
+        y, sr = load_audio_mono(wav_path)
+    finally:
+        cleanup()
     y, sr = resample_to_22050(y, sr)
     duration_s = float(len(y) / sr)
     frame_dt_s = float(HOP / sr)
@@ -364,6 +553,7 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
     chroma_bins_2s = chroma_bins(chroma, t_frames, duration_s, bin_s=CHROMA_BIN_S)
 
     est_key, key_method = estimate_key_from_chroma(chroma_mean)
+    key_reg = key_regions(chroma, t_frames, duration_s, region_s=30)
 
     # 1Hz aggregation
     energy_1hz = agg_to_1hz(rms_f, t_frames, duration_s)
@@ -378,15 +568,12 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
     events += peak_events(t_frames, onset_env, "onset_peak", min_gap_s=12.0, top_k=12)
     events += peak_events(t_frames, flux_f, "flux_peak", min_gap_s=12.0, top_k=12)
 
-    # Phases
+    # Adaptive thresholds from this track's data
+    energy_thresh, bright_thresh = compute_adaptive_thresholds(energy_1hz, bright_1hz)
+
+    # Phases: detect from signal or use manual override
     if phases is None:
-        phases = [
-            {"label":"build", "start":0.0, "end":min(20.0, duration_s)},
-            {"label":"drive", "start":min(20.0, duration_s), "end":min(100.0, duration_s)},
-            {"label":"bridge_dip", "start":min(100.0, duration_s), "end":min(130.0, duration_s)},
-            {"label":"rebuild_climax", "start":min(130.0, duration_s), "end":min(200.0, duration_s)},
-            {"label":"taper", "start":min(200.0, duration_s), "end":duration_s},
-        ]
+        phases = detect_phases(energy_1hz, duration_s)
 
     def mean_over(start_s, end_s, arr):
         a = int(max(0, math.floor(start_s)))
@@ -407,7 +594,7 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
             "onset_mean": float(round(mean_over(ph["start"], ph["end"], onset_1hz), 6)),
         })
 
-    interpretive = build_interpretive_map(energy_1hz, bright_1hz, flux_1hz, onset_1hz, window_s=WINDOW_S)
+    interpretive = build_interpretive_map(energy_1hz, bright_1hz, flux_1hz, onset_1hz, energy_thresh, bright_thresh, phases, window_s=WINDOW_S)
 
     # ---- Graphs ----
     # 1) Waveform
@@ -473,7 +660,7 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
             "hop": int(HOP),
             "n_fft": int(N_FFT),
             "frame_dt_s": float(frame_dt_s),
-            "created_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "created_utc": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat() + "Z",
             "analysis_notes": (
                 "HTF v2 fallback pipeline: soundfile/scipy load+resample, scipy.signal.stft, "
                 "RMS/centroid/flux/onset proxy, tempo via autocorr, chroma via pitch-class mapping, "
@@ -481,6 +668,7 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
             ),
             "tempo_bpm": float(round(tempo_bpm, 3)),
             "tempo_confidence": None if tempo_conf is None else float(round(tempo_conf, 6)),
+            "tempo_reliable": tempo_conf is not None and tempo_conf >= 2.0,
             "tempo_candidates_bpm": [float(round(x, 3)) for x in tempo_cands],
             "beat0_s_est": float(round(beat0, 3)),
             "estimated_key": est_key,
@@ -495,6 +683,7 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
         },
         "rhythm": {
             "tempo_bpm": float(round(tempo_bpm, 3)),
+            "tempo_reliable": tempo_conf is not None and tempo_conf >= 2.0,
             "beat_times_s": [float(round(x, 3)) for x in beat_times],
             "beats_count": int(len(beat_times)),
             "bar_times_s_every_4_beats": [float(round(x, 3)) for x in bar_times],
@@ -505,6 +694,7 @@ def generate_htf_v2(audio_path, out_dir, title="", artist="", slug="song", phase
         "harmony": {
             "chroma_mean_12_C_to_B": [float(x) for x in chroma_mean],
             "chroma_bins_2s_C_to_B": chroma_bins_2s,
+            "key_regions": key_reg,
             "chroma_method": "STFT pitch-class mapping",
         },
         "structure": {
